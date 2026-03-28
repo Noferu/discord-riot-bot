@@ -1,12 +1,10 @@
 import discord
 import logging
 import asyncio
-import re
 import time
 from discord.ext import commands
 from config import DISCORD_TOKEN, POLL_CHANNEL_ID, ROLE_IDS
-from core.ai import ask_ai
-from core.riot import (
+from riot import (
     players, safe_save,
     get_puuid, get_spectator, get_lp,
     get_last_match_result, get_recent_results,
@@ -27,157 +25,6 @@ bot = commands.Bot(
     command_prefix='!',
     intents=intents
 )
-
-# ----------------------------------
-# CONTEXT BUILDER
-# ----------------------------------
-
-async def get_riot_context(puuids_with_names: list[tuple[str, str]]) -> str:
-    """Fetches recent match results for a list of (puuid, display_name) tuples."""
-    lines = []
-    for puuid, display_name in puuids_with_names:
-        results = await get_recent_results(puuid, count=5)
-        if not results:
-            lines.append(f"{display_name} : aucune partie ranked récente trouvée.")
-            continue
-
-        wins   = results.count("win")
-        losses = results.count("loss")
-        last   = await get_last_match_result(puuid)
-        lp     = await get_lp(puuid)
-
-        summary = f"{display_name} : {wins}V {losses}D sur les {len(results)} dernières ranked"
-        if lp is not None:
-            summary += f", {lp} LP actuellement"
-        if last:
-            kda     = f"{last['kills']}/{last['deaths']}/{last['assists']}"
-            outcome = "victoire" if last["win"] else "défaite"
-            summary += f". Dernière game : {outcome} sur {last['champion']} ({kda})"
-
-        lines.append(summary)
-
-    return "\n".join(lines)
-
-
-async def resolve_players_in_message(message: discord.Message) -> list[tuple[str, str]]:
-    """
-    Detects players mentioned in a message via three methods:
-    1. Discord mentions (@someone) → look up in players.json by discord_id
-    2. GameName#TAG in plain text → fetch puuid from Riot API directly
-    3. Exact game_name match in plain text → look up in players.json
-
-    Returns a deduplicated list of (puuid, display_name).
-    """
-    seen_puuids = set()
-    result = []
-
-    def add(puuid, name):
-        if puuid not in seen_puuids:
-            seen_puuids.add(puuid)
-            result.append((puuid, name))
-
-    # 1. Discord mentions
-    for member in message.mentions:
-        if member.id == bot.user.id:
-            continue
-        discord_id = str(member.id)
-        if discord_id in players:
-            for account in players[discord_id]["accounts"]:
-                add(account["puuid"], f"{account['game_name']}#{account['tag_line']}")
-
-    # 2. GameName#TAG in plain text
-    riot_id_pattern = re.compile(r"([\w\s]+)#(\w+)")
-    for match in riot_id_pattern.finditer(message.content):
-        game_name = match.group(1).strip()
-        tag_line  = match.group(2).strip()
-        try:
-            puuid = await get_puuid(game_name, tag_line)
-            add(puuid, f"{game_name}#{tag_line}")
-        except Exception:
-            pass
-
-    # 3. Exact game_name match in plain text
-    content_lower = message.content.lower()
-    for data in players.values():
-        for account in data["accounts"]:
-            if account["game_name"].lower() in content_lower:
-                add(account["puuid"], f"{account['game_name']}#{account['tag_line']}")
-
-    # Always include the message author if they have linked accounts
-    author_id = str(message.author.id)
-    if author_id in players:
-        for account in players[author_id]["accounts"]:
-            add(account["puuid"], f"{account['game_name']}#{account['tag_line']} (auteur)")
-
-    return result
-
-
-async def build_ai_contents(message: discord.Message) -> list:
-    """
-    Builds the full conversation history to send to Gemini:
-    - Last 10 channel messages as user/model turns
-    - Reference chain (replied-to messages, up to 10)
-    - Riot context for detected players
-    - The actual message as the final user turn
-    """
-    contents = []
-
-    # Last 3 channel messages (excluding the triggering message)
-    history = []
-    async for msg in message.channel.history(limit=4):
-        if msg.id == message.id:
-            continue
-        history.append(msg)
-    history.reverse()
-
-    for msg in history:
-        role   = "model" if msg.author.id == bot.user.id else "user"
-        author = "Shaconnard" if role == "model" else msg.author.display_name
-        contents.append({
-            "role":  role,
-            "parts": [{"text": f"{author} : {msg.content}"}]
-        })
-
-    # Reference chain
-    ref_chain = []
-    ref       = message.reference
-    depth     = 0
-    while ref and depth < 5:
-        try:
-            ref_msg = await message.channel.fetch_message(ref.message_id)
-            ref_chain.append(ref_msg)
-            ref   = ref_msg.reference
-            depth += 1
-        except Exception:
-            break
-
-    if ref_chain:
-        ref_chain.reverse()
-        ref_text = "\n".join(
-            f"{'Shaconnard' if m.author.id == bot.user.id else m.author.display_name} : {m.content}"
-            for m in ref_chain
-        )
-        contents.append({
-            "role":  "user",
-            "parts": [{"text": f"[Fil de réponses]\n{ref_text}"}]
-        })
-
-    # Riot context
-    players_in_msg = await resolve_players_in_message(message)
-    if players_in_msg:
-        riot_context = await get_riot_context(players_in_msg)
-        contents.append({
-            "role":  "user",
-            "parts": [{"text": f"[Contexte LoL des joueurs mentionnés]\n{riot_context}"}]
-        })
-
-    # Actual message
-    contents.append({
-        "role":  "user",
-        "parts": [{"text": f"{message.author.display_name} : {message.content}"}]
-    })
-
-    return contents
 
 # ----------------------------------
 # HELPERS
@@ -431,20 +278,10 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    if bot.user.mentioned_in(message):
-        async with message.channel.typing():
-            try:
-                contents = await build_ai_contents(message)
-                response = await ask_ai(contents)
-            except Exception as e:
-                print(f"AI error: {e}")
-                response = "Oh… tu attends une réponse ? Pas maintenant. Réessaie plus tard… ou abandonne, ça m'est égal."
-        await message.reply(response)
-
     if "merde" in message.content.lower():
         await message.delete()
         await message.channel.send(
-            f"Doucement {message.author.mention}… ce genre de mots, c'est mon domaine. Contente-toi de jouer, je m'occupe du reste… hehe."
+            f"Doucement {message.author.mention}… ce genre de mots, c'est mon domaine."
         )
 
     await bot.process_commands(message)
