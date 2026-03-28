@@ -551,6 +551,29 @@ async def unlink(ctx, *, riot_id: str = None):
         await safe_save(players)
         await ctx.send("Plus rien à observer… tu fuis déjà ?")
 
+@bot.command(name="refreshpuuid")
+async def refresh_puuid(ctx):
+    """Refresh all PUUIDs from game_name#tag_line via Riot API."""
+    updated = 0
+    failed = []
+
+    for discord_id_str, data in players.items():
+        for account in data["accounts"]:
+            try:
+                new_puuid = await get_puuid(account["game_name"], account["tag_line"])
+                account["puuid"] = new_puuid
+                updated += 1
+            except Exception as e:
+                failed.append(f"{account['game_name']}#{account['tag_line']} ({e})")
+
+    await safe_save(players)
+
+    msg = f"✅ {updated} compte(s) mis à jour."
+    if failed:
+        msg += "\n❌ Échecs :\n" + "\n".join(failed)
+
+    await ctx.send(msg)
+
 # ----------------------------------
 
 bot.run(

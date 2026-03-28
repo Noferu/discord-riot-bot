@@ -52,7 +52,7 @@ async def ask_ai(contents: list) -> str:
     response = await loop.run_in_executor(
         None,
         lambda: client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-3-flash",
             config=genai.types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
             ),
